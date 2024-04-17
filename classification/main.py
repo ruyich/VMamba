@@ -32,25 +32,9 @@ from utils.logger import create_logger
 from utils.utils import  NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor
 from utils.utils import load_checkpoint_ema, load_pretrained_ema, save_checkpoint_ema
 
-from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count
+from fvcore.nn import FlopCountAnalysis, flop_count_str
 
 from timm.utils import ModelEma as ModelEma
-
-if torch.multiprocessing.get_start_method() != "spawn":
-    print(f"||{torch.multiprocessing.get_start_method()}||", end="")
-    torch.multiprocessing.set_start_method("spawn", force=True)
-
-
-def import_abspy(name="models", path="classification/"):
-    import sys
-    import importlib
-    path = os.path.abspath(path)
-    assert os.path.isdir(path)
-    sys.path.insert(0, path)
-    module = importlib.import_module(name)
-    sys.path.pop(0)
-    return module
-
 
 def str2bool(v):
     """
@@ -68,7 +52,7 @@ def str2bool(v):
 
 
 def parse_option():
-    parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
+    parser = argparse.ArgumentParser('VMamba training and evaluation script', add_help=False)
     parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file', )
     parser.add_argument(
         "--opts",
@@ -121,18 +105,16 @@ def main(config, args):
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
 
-    if dist.get_rank() == 0:
-        if hasattr(model, 'flops'):
-            logger.info(str(model))
-            n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            logger.info(f"number of params: {n_parameters}")
-            flops = model.flops()
-            logger.info(f"number of GFLOPs: {flops / 1e9}")
-        else:
-            logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
+    if hasattr(model, 'flops'):
+        logger.info(str(model))
+        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"number of params: {n_parameters}")
+        flops = model.flops()
+        logger.info(f"number of GFLOPs: {flops / 1e9}")
+    else:
+        logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
 
     model.cuda()
-    model_without_ddp = model
 
     model_ema = None
     if args.model_ema:
@@ -146,7 +128,6 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -178,7 +159,7 @@ def main(config, args):
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
     if config.MODEL.RESUME:
-        max_accuracy, max_accuracy_ema = load_checkpoint_ema(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger, model_ema)
+        max_accuracy, max_accuracy_ema = load_checkpoint_ema(config, model, optimizer, lr_scheduler, loss_scaler, logger, model_ema)
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         if model_ema is not None:
@@ -189,7 +170,7 @@ def main(config, args):
             return
 
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
-        load_pretrained_ema(config, model_without_ddp, logger, model_ema)
+        load_pretrained_ema(config, model, logger, model_ema)
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         if model_ema is not None:
@@ -199,7 +180,7 @@ def main(config, args):
         if config.EVAL_MODE:
             return
 
-    if config.THROUGHPUT_MODE and (dist.get_rank() == 0):
+    if config.THROUGHPUT_MODE:
         logger.info(f"throughput mode ==============================")
         throughput(data_loader_val, model, logger)
         if model_ema is not None:
@@ -215,8 +196,8 @@ def main(config, args):
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema)
+        if epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1):
+            save_checkpoint_ema(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema)
 
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
@@ -227,7 +208,6 @@ def main(config, args):
             logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
             max_accuracy_ema = max(max_accuracy_ema, acc1_ema)
             logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
-
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -274,8 +254,6 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             if model_ema is not None:
                 model_ema.update(model)
         loss_scale_value = loss_scaler.state_dict()["scale"]
-
-        torch.cuda.synchronize()
 
         loss_meter.update(loss.item(), targets.size(0))
         if grad_norm is not None:  # loss_scaler return None if not update
@@ -380,18 +358,9 @@ if __name__ == '__main__':
     if config.AMP_OPT_LEVEL:
         print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
 
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        print(f"RANK and WORLD_SIZE in environ: {rank}/{world_size}")
-    else:
-        rank = -1
-        world_size = -1
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
-    dist.barrier()
+    torch.cuda.set_device(0)
 
-    seed = config.SEED + dist.get_rank()
+    seed = config.SEED
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
@@ -399,9 +368,9 @@ if __name__ == '__main__':
     cudnn.benchmark = True
 
     # linear scale the learning rate according to total batch size, may not be optimal
-    linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE / 512.0
+    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE / 512.0
+    linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE / 512.0
     # gradient accumulation also need to scale the learning rate
     if config.TRAIN.ACCUMULATION_STEPS > 1:
         linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
@@ -413,26 +382,14 @@ if __name__ == '__main__':
     config.TRAIN.MIN_LR = linear_scaled_min_lr
     config.freeze()
 
-    # to make sure all the config.OUTPUT are the same
-    config.defrost()
-    if dist.get_rank() == 0:
-        obj = [config.OUTPUT]
-        # obj = [str(random.randint(0, 100))] # for test
-    else:
-        obj = [None]
-    dist.broadcast_object_list(obj)
-    dist.barrier()
-    config.OUTPUT = obj[0]
     print(config.OUTPUT, flush=True)
-    config.freeze()
     os.makedirs(config.OUTPUT, exist_ok=True)
-    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
+    logger = create_logger(output_dir=config.OUTPUT, dist_rank=0, name=f"{config.MODEL.NAME}")
 
-    if dist.get_rank() == 0:
-        path = os.path.join(config.OUTPUT, "config.json")
-        with open(path, "w") as f:
-            f.write(config.dump())
-        logger.info(f"Full config saved to {path}")
+    path = os.path.join(config.OUTPUT, "config.json")
+    with open(path, "w") as f:
+        f.write(config.dump())
+    logger.info(f"Full config saved to {path}")
 
     # print config
     logger.info(config.dump())
